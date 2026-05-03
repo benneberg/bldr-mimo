@@ -123,25 +123,106 @@ if (ADMIN_USER && ADMIN_PASS) {
   });
 }
 
-// ─── Server-side MiMo Proxy ───────────────────────────────────────────────────
-// API key lives ONLY on the server. Frontend calls /api/mimo, never Xiaomi directly.
-app.post('/api/mimo', async (req, res) => {
-  const apiKey = process.env.MIMO_API_KEY;
-  if (!apiKey) {
-    return res.status(500).json({ error: 'MIMO_API_KEY is not configured on the server' });
-  }
+// ─── AI Provider Proxy ───────────────────────────────────────────────────────
+// Uses the OpenAI SDK pointed at each provider's base URL.
+// API keys live ONLY here — never sent to the frontend.
+
+import OpenAI from 'openai';
+
+type Provider = 'mimo' | 'openai';
+type ModelTier = 'smart' | 'fast' | 'cheap';
+
+const PROVIDERS = {
+  mimo: {
+    baseURL: 'https://token-plan-ams.xiaomimimo.com/v1',
+    apiKey: () => process.env.MIMO_API_KEY || '',
+  },
+  openai: {
+    baseURL: 'https://api.openai.com/v1',
+    apiKey: () => process.env.OPENAI_API_KEY || '',
+  },
+};
+
+const MODELS: Record<Provider, Record<ModelTier, string>> = {
+  mimo: {
+    smart: 'MiMo-V2.5-Pro',
+    fast:  'MiMo-V2.5',
+    cheap: 'MiMo-V2-Pro',
+  },
+  openai: {
+    smart: 'gpt-4o',
+    fast:  'gpt-4o-mini',
+    cheap: 'gpt-4o-mini',
+  },
+};
+
+function getClient(provider: Provider): OpenAI {
+  const cfg = PROVIDERS[provider];
+  return new OpenAI({ apiKey: cfg.apiKey(), baseURL: cfg.baseURL });
+}
+
+async function withRetry<T>(fn: () => Promise<T>, retries = 3, delayMs = 1000): Promise<T> {
   try {
-    const mimoRes = await fetch('https://token-plan-ams.xiaomimimo.com/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'api-key': apiKey,
-      },
-      body: JSON.stringify(req.body),
-    });
-    const data = await mimoRes.json();
-    res.status(mimoRes.status).json(data);
+    return await fn();
   } catch (err: any) {
+    if (retries <= 0) throw err;
+    await new Promise(r => setTimeout(r, delayMs));
+    return withRetry(fn, retries - 1, delayMs * 1.5);
+  }
+}
+
+app.post('/api/ai', async (req, res) => {
+  const { provider = 'mimo', tier = 'smart', messages, tools, tool_choice, temperature = 0.2 } = req.body;
+
+  const resolvedProvider = (provider in PROVIDERS ? provider : 'mimo') as Provider;
+  const resolvedTier = (tier in (MODELS[resolvedProvider] ?? {}) ? tier : 'smart') as ModelTier;
+  const model = MODELS[resolvedProvider][resolvedTier];
+  const apiKey = PROVIDERS[resolvedProvider].apiKey();
+
+  if (!apiKey) {
+    return res.status(500).json({
+      error: `API key not configured for provider "${resolvedProvider}". Set ${resolvedProvider === 'mimo' ? 'MIMO_API_KEY' : 'OPENAI_API_KEY'} in environment variables.`
+    });
+  }
+
+  try {
+    const client = getClient(resolvedProvider);
+
+    const result = await withRetry(() =>
+      client.chat.completions.create({
+        model,
+        messages,
+        tools,
+        tool_choice,
+        temperature,
+      } as any)
+    );
+
+    res.json(result);
+  } catch (err: any) {
+    console.error(`[AI Proxy] ${resolvedProvider}/${model} error:`, err.message);
+
+    // Fallback to MiMo fast tier if primary call fails (and we're not already on mimo/fast)
+    if (resolvedProvider !== 'mimo' || resolvedTier !== 'fast') {
+      console.log('[AI Proxy] Attempting fallback to mimo/fast...');
+      try {
+        const fallbackClient = getClient('mimo');
+        const fallbackKey = PROVIDERS.mimo.apiKey();
+        if (fallbackKey) {
+          const fallbackResult = await fallbackClient.chat.completions.create({
+            model: MODELS.mimo.fast,
+            messages,
+            tools,
+            tool_choice,
+            temperature,
+          } as any);
+          return res.json(fallbackResult);
+        }
+      } catch (fallbackErr: any) {
+        console.error('[AI Proxy] Fallback also failed:', fallbackErr.message);
+      }
+    }
+
     res.status(500).json({ error: err.message });
   }
 });
