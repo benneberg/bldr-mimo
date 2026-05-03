@@ -3,7 +3,7 @@ import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs/promises';
-import { existsSync } from 'fs';
+import { existsSync, mkdirSync } from 'fs';
 import Database from 'better-sqlite3';
 import axios from 'axios';
 import AdmZip from 'adm-zip';
@@ -27,18 +27,14 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DB_PATH = path.join(DATA_DIR, 'mimo.db');
 const WORKSPACE_ROOT = path.join(DATA_DIR, 'workspace');
 
-// Ensure data dirs exist (critical on first deploy with mounted volume)
-if (!existsSync(DATA_DIR)) {
-  await fs.mkdir(DATA_DIR, { recursive: true });
-}
-if (!existsSync(WORKSPACE_ROOT)) {
-  await fs.mkdir(WORKSPACE_ROOT, { recursive: true });
-}
+// ─── Sync dir init (no top-level await — predictable startup) ─────────────────
+// Use sync mkdirSync so dirs exist before DB opens. No race conditions.
+if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+if (!existsSync(WORKSPACE_ROOT)) mkdirSync(WORKSPACE_ROOT, { recursive: true });
 
-// Database Setup
+// ─── Database Setup ───────────────────────────────────────────────────────────
 const db = new Database(DB_PATH);
 
-// Initial basic tables
 db.exec(`
   CREATE TABLE IF NOT EXISTS projects (
     id TEXT PRIMARY KEY,
@@ -75,36 +71,42 @@ db.exec(`
   );
 `);
 
-// Migrations for schema evolution
+// ─── Migrations ───────────────────────────────────────────────────────────────
 function applyMigrations() {
   const tableInfos: Record<string, any[]> = {
-    projects: db.prepare("PRAGMA table_info(projects)").all() as any[],
-    files: db.prepare("PRAGMA table_info(files)").all() as any[]
+    projects: db.prepare('PRAGMA table_info(projects)').all() as any[],
+    files: db.prepare('PRAGMA table_info(files)').all() as any[],
   };
-
   if (!tableInfos.projects.some(c => c.name === 'workspace_config')) {
-    db.exec("ALTER TABLE projects ADD COLUMN workspace_config JSON");
+    db.exec('ALTER TABLE projects ADD COLUMN workspace_config JSON');
   }
-
   if (!tableInfos.files.some(c => c.name === 'repository_id')) {
-    db.exec("ALTER TABLE files ADD COLUMN repository_id TEXT");
+    db.exec('ALTER TABLE files ADD COLUMN repository_id TEXT');
   }
 }
 
 applyMigrations();
 
+// ─── Express App ──────────────────────────────────────────────────────────────
 const app = express();
 app.use(express.json());
 
+// ─── Health endpoint — must be FIRST, before auth, before anything ────────────
+// Railway probes this. Responds instantly — no DB, no auth, no async.
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok' });
+});
+
 // ─── Basic Auth Gate ──────────────────────────────────────────────────────────
-// Protects the entire app with a username/password.
-// Set ADMIN_USER and ADMIN_PASS in Railway environment variables.
-// Skip auth in dev if vars are not set.
+// Only activates when ADMIN_USER + ADMIN_PASS are set (skipped in local dev).
 const ADMIN_USER = process.env.ADMIN_USER;
 const ADMIN_PASS = process.env.ADMIN_PASS;
 
 if (ADMIN_USER && ADMIN_PASS) {
   app.use((req, res, next) => {
+    // Let the healthcheck through without auth
+    if (req.path === '/health') return next();
+
     const auth = req.headers.authorization;
     if (!auth || !auth.startsWith('Basic ')) {
       res.setHeader('WWW-Authenticate', 'Basic realm="bldr"');
@@ -122,8 +124,7 @@ if (ADMIN_USER && ADMIN_PASS) {
 }
 
 // ─── Server-side MiMo Proxy ───────────────────────────────────────────────────
-// The API key lives ONLY on the server (process.env.MIMO_API_KEY).
-// The frontend calls /api/mimo — never touches the key directly.
+// API key lives ONLY on the server. Frontend calls /api/mimo, never Xiaomi directly.
 app.post('/api/mimo', async (req, res) => {
   const apiKey = process.env.MIMO_API_KEY;
   if (!apiKey) {
@@ -147,13 +148,13 @@ app.post('/api/mimo', async (req, res) => {
 
 const upload = multer({ dest: 'uploads/' });
 
-// --- Helper Functions ---
+// ─── Helper Functions ─────────────────────────────────────────────────────────
 
 async function generateProjectContext(projectId: string) {
   const projectDir = path.join(WORKSPACE_ROOT, projectId);
   const files = db.prepare('SELECT path, size, repository_id FROM files WHERE project_id = ?').all(projectId) as any[];
   const repos = db.prepare('SELECT * FROM repositories WHERE project_id = ?').all(projectId) as any[];
-  
+
   let workspaceContext = `# MiMo Workspace Context: ${projectId}\n\n`;
   workspaceContext += `## Repositories (Services)\n\n`;
   repos.forEach(r => {
@@ -161,8 +162,7 @@ async function generateProjectContext(projectId: string) {
   });
 
   workspaceContext += `\n## Global File Tree\n\n`;
-  
-  // Simple tree representation
+
   const tree: any = {};
   files.forEach(f => {
     const parts = f.path.split('/');
@@ -186,50 +186,37 @@ async function generateProjectContext(projectId: string) {
     }
     return res;
   };
-  
+
   workspaceContext += renderTree(tree);
-  
-  // Bootstrap LLM.md (Architectural/Coding Conventions) if it doesn't exist
+
   const llmPath = path.join(projectDir, 'LLM.md');
   if (!existsSync(llmPath)) {
-    let llmContent = `# Architectural Conventions (LLM.md)\n\n`;
-    llmContent += `## Tech Stack\n`;
-    
+    let llmContent = `# Architectural Conventions (LLM.md)\n\n## Tech Stack\n`;
     const hasTS = files.some(f => f.path.endsWith('.ts') || f.path.endsWith('.tsx'));
     const hasReact = files.some(f => f.path.includes('react'));
     const hasNode = files.some(f => f.path === 'package.json');
-
     if (hasTS) llmContent += `- TypeScript\n`;
     if (hasReact) llmContent += `- React\n`;
     if (hasNode) llmContent += `- Node.js\n`;
-
     llmContent += `\n## Development Guidelines\n- Prefer functional components and hooks.\n- Use Tailwind CSS for styling.\n- Maintain type safety for all new modules.\n`;
-    
     await fs.writeFile(llmPath, llmContent);
     db.prepare('INSERT OR REPLACE INTO files (project_id, path, size) VALUES (?, ?, ?)')
       .run(projectId, 'LLM.md', llmContent.length);
   }
 
-  // Create per-repo artifacts if it's a workspace
   for (const repo of repos) {
-    let repoCtx = `# Package Context: ${repo.name}\n\n`;
-    repoCtx += `Type: ${repo.type}\nTags: ${repo.tags}\n\n`;
-    
+    let repoCtx = `# Package Context: ${repo.name}\n\nType: ${repo.type}\nTags: ${repo.tags}\n\n## Key Files Summary\n\n`;
     const repoFiles = files.filter(f => f.repository_id === repo.id);
     const keyExtensions = ['.ts', '.tsx', '.js', '.jsx', '.html', '.css', '.json', '.md'];
-    
-    repoCtx += `## Key Files Summary\n\n`;
     for (const file of repoFiles) {
       const ext = path.extname(file.path);
       if (file.size < 5000 && keyExtensions.includes(ext)) {
         try {
-          const fullPath = path.join(projectDir, file.path);
-          const content = await fs.readFile(fullPath, 'utf-8');
+          const content = await fs.readFile(path.join(projectDir, file.path), 'utf-8');
           repoCtx += `### ${file.path}\n\n\`\`\`${ext.slice(1)}\n${content}\n\`\`\`\n\n`;
         } catch (e) {}
       }
     }
-    
     const repoCtxPath = path.join(projectDir, repo.path_prefix, 'CONTEXT.md');
     const repoDir = path.dirname(repoCtxPath);
     if (!existsSync(repoDir)) await fs.mkdir(repoDir, { recursive: true });
@@ -238,8 +225,6 @@ async function generateProjectContext(projectId: string) {
 
   const workspacePath = path.join(projectDir, 'WORKSPACE.md');
   await fs.writeFile(workspacePath, workspaceContext);
-  
-  // Register artifacts in DB
   db.prepare('INSERT OR REPLACE INTO files (project_id, path, size) VALUES (?, ?, ?)')
     .run(projectId, 'WORKSPACE.md', workspaceContext.length);
 }
@@ -253,15 +238,13 @@ function sanitizePath(projectId: string, userPath: string) {
   return resolvedPath;
 }
 
-// --- API Routes ---
+// ─── API Routes ───────────────────────────────────────────────────────────────
 
-// List projects
-app.get('/api/projects', (req, res) => {
+app.get('/api/projects', (_req, res) => {
   const projects = db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all();
   res.json(projects);
 });
 
-// Create project
 app.post('/api/projects', (req, res) => {
   const { name } = req.body;
   const id = uuidv4();
@@ -273,19 +256,17 @@ app.post('/api/projects', (req, res) => {
   res.json({ id, name });
 });
 
-// List repositories for a project
 app.get('/api/projects/:projectId/repositories', (req, res) => {
   const { projectId } = req.params;
   const repos = db.prepare('SELECT * FROM repositories WHERE project_id = ?').all(projectId);
   res.json(repos);
 });
 
-// GitHub Import (Advanced: Workshop Support)
 app.post('/api/import/github', async (req, res) => {
   const { url, name, projectId: existingProjectId, type, tags } = req.body;
   const id = existingProjectId || uuidv4();
   const repoId = uuidv4();
-  
+
   try {
     let zipUrl = url;
     if (url.includes('github.com') && !url.endsWith('.zip')) {
@@ -295,20 +276,16 @@ app.post('/api/import/github', async (req, res) => {
     const response = await axios.get(zipUrl, { responseType: 'arraybuffer' });
     const zip = new AdmZip(Buffer.from(response.data));
     const projectDir = path.join(WORKSPACE_ROOT, id);
-    
-    // If it's a new project, create entry
+
     if (!existingProjectId) {
       db.prepare('INSERT INTO projects (id, name) VALUES (?, ?)').run(id, name || 'New Workspace');
       await fs.mkdir(projectDir, { recursive: true });
     }
 
-    // Determine path prefix for this repo (e.g. services/my-repo)
-    // If it's the first repo in a workspace, we might put it in root or a subdir
-    // For CCC style, let's put it in a subdir if it's a workspace
     const repoSlug = name || url.split('/').pop().replace('.git', '');
     const pathPrefix = existingProjectId ? `services/${repoSlug}` : '';
     const repoTargetDir = path.join(projectDir, pathPrefix);
-    
+
     if (!existsSync(repoTargetDir)) {
       await fs.mkdir(repoTargetDir, { recursive: true });
     }
@@ -316,34 +293,24 @@ app.post('/api/import/github', async (req, res) => {
     db.prepare('INSERT INTO repositories (id, project_id, name, url, path_prefix, type, tags) VALUES (?, ?, ?, ?, ?, ?, ?)')
       .run(repoId, id, repoSlug, url, pathPrefix, type || 'unknown', tags || '');
 
-    const zipEntries = zip.getEntries();
     const ignoreList = ['node_modules/', 'dist/', 'build/', '.git/', 'coverage/', '.next/'];
-    
-    for (const entry of zipEntries) {
+    for (const entry of zip.getEntries()) {
       if (entry.isDirectory) continue;
       if (ignoreList.some(ignore => entry.entryName.includes(ignore))) continue;
-      
       const parts = entry.entryName.split('/');
       const fileNameInsideRepo = parts.slice(1).join('/');
       if (!fileNameInsideRepo) continue;
-
       const fullRelativePath = path.join(pathPrefix, fileNameInsideRepo);
       const filePath = path.join(projectDir, fullRelativePath);
       const dirPath = path.dirname(filePath);
-      
-      if (!existsSync(dirPath)) {
-        await fs.mkdir(dirPath, { recursive: true });
-      }
-
+      if (!existsSync(dirPath)) await fs.mkdir(dirPath, { recursive: true });
       const content = entry.getData();
       await fs.writeFile(filePath, content);
-
       db.prepare('INSERT OR REPLACE INTO files (project_id, repository_id, path, size) VALUES (?, ?, ?, ?)')
         .run(id, repoId, fullRelativePath, content.length);
     }
 
     await generateProjectContext(id);
-
     res.json({ id, repoId });
   } catch (error: any) {
     console.error('Import failed:', error);
@@ -355,53 +322,34 @@ app.post('/api/import/zip', upload.single('file'), async (req, res) => {
   const { name } = req.body;
   const id = uuidv4();
   const repoId = uuidv4();
-  
-  if (!req.file) {
-    return res.status(400).json({ error: 'No file uploaded' });
-  }
+
+  if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
 
   try {
     const zip = new AdmZip(req.file.path);
     const projectDir = path.join(WORKSPACE_ROOT, id);
-    
     db.prepare('INSERT INTO projects (id, name) VALUES (?, ?)').run(id, name || 'Uploaded Workspace');
     await fs.mkdir(projectDir, { recursive: true });
 
-    const pathPrefix = ''; // Root for ZIP uploads usually
     const repoSlug = name || 'main-repo';
-    
     db.prepare('INSERT INTO repositories (id, project_id, name, path_prefix, type) VALUES (?, ?, ?, ?, ?)')
-      .run(repoId, id, repoSlug, pathPrefix, 'uploaded');
+      .run(repoId, id, repoSlug, '', 'uploaded');
 
-    const zipEntries = zip.getEntries();
     const ignoreList = ['node_modules/', 'dist/', 'build/', '.git/', 'coverage/', '.next/', '__MACOSX'];
-    
-    for (const entry of zipEntries) {
+    for (const entry of zip.getEntries()) {
       if (entry.isDirectory) continue;
       if (ignoreList.some(ignore => entry.entryName.includes(ignore))) continue;
-      
-      const entryName = entry.entryName;
-      // Some zips have a root folder, some don't. 
-      // Simplified: just write the file as is if it doesn't look like a root folder we should skip
-      const filePath = path.join(projectDir, entryName);
+      const filePath = path.join(projectDir, entry.entryName);
       const dirPath = path.dirname(filePath);
-      
-      if (!existsSync(dirPath)) {
-        await fs.mkdir(dirPath, { recursive: true });
-      }
-
+      if (!existsSync(dirPath)) await fs.mkdir(dirPath, { recursive: true });
       const content = entry.getData();
       await fs.writeFile(filePath, content);
-
       db.prepare('INSERT OR REPLACE INTO files (project_id, repository_id, path, size) VALUES (?, ?, ?, ?)')
-        .run(id, repoId, entryName, content.length);
+        .run(id, repoId, entry.entryName, content.length);
     }
 
     await generateProjectContext(id);
-    
-    // Cleanup upload
     await fs.unlink(req.file.path);
-
     res.json({ id, repoId });
   } catch (error: any) {
     console.error('ZIP Import failed:', error);
@@ -409,19 +357,17 @@ app.post('/api/import/zip', upload.single('file'), async (req, res) => {
   }
 });
 
-// Get files tree with repo info
 app.get('/api/files/:projectId', async (req, res) => {
   const { projectId } = req.params;
   const files = db.prepare(`
-    SELECT f.path, f.size, r.name as repo_name, r.id as repo_id 
-    FROM files f 
-    LEFT JOIN repositories r ON f.repository_id = r.id 
+    SELECT f.path, f.size, r.name as repo_name, r.id as repo_id
+    FROM files f
+    LEFT JOIN repositories r ON f.repository_id = r.id
     WHERE f.project_id = ?
   `).all(projectId);
   res.json(files);
 });
 
-// Get file content
 app.get('/api/files/:projectId/content', async (req, res) => {
   const { projectId } = req.params;
   const { path: filePath } = req.query;
@@ -435,33 +381,24 @@ app.get('/api/files/:projectId/content', async (req, res) => {
 });
 
 app.post('/api/tools/align_check', async (req, res) => {
-  const { projectId, requirement } = req.body;
+  const { projectId } = req.body;
   try {
     const projectDir = path.join(WORKSPACE_ROOT, projectId);
+    let context = '';
     const workspacePath = path.join(projectDir, 'WORKSPACE.md');
     const llmPath = path.join(projectDir, 'LLM.md');
-    
-    let context = '';
     if (existsSync(workspacePath)) context += await fs.readFile(workspacePath, 'utf-8');
-    if (existsSync(llmPath)) context += "\n\n" + await fs.readFile(llmPath, 'utf-8');
-
-    // This tool is meant to be called by the AI itself, but we can provide a basic response
-    // Or we could trigger a specific Gemini call here if we wanted to be autonomous.
-    res.json({ 
-      status: 'analyzing', 
-      context_found: !!context,
-      message: "Alignment check initiated against WORKSPACE.md and LLM.md" 
-    });
+    if (existsSync(llmPath)) context += '\n\n' + await fs.readFile(llmPath, 'utf-8');
+    res.json({ status: 'analyzing', context_found: !!context, message: 'Alignment check initiated' });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
 });
 
 app.post('/api/tools/generate_pkml', async (req, res) => {
-  const { projectId, content } = req.body; // AI generated PKML content
+  const { projectId, content } = req.body;
   try {
-    const projectDir = path.join(WORKSPACE_ROOT, projectId);
-    const pkmlPath = path.join(projectDir, 'PKML.md');
+    const pkmlPath = path.join(WORKSPACE_ROOT, projectId, 'PKML.md');
     await fs.writeFile(pkmlPath, content);
     db.prepare('INSERT OR REPLACE INTO files (project_id, path, size) VALUES (?, ?, ?)')
       .run(projectId, 'PKML.md', content.length);
@@ -478,19 +415,13 @@ app.post('/api/tools/analyze_file', async (req, res) => {
     const content = await fs.readFile(fullPath, 'utf-8');
     const stats = await fs.stat(fullPath);
     const ext = path.extname(filePath).slice(1);
-    
-    // Quick heuristic analysis
     const lines = content.split('\n').length;
-    const purpose = filePath.includes('test') ? 'Testing' : 
-                   filePath.includes('config') ? 'Configuration' :
-                   ['ts', 'tsx', 'js', 'jsx'].includes(ext) ? 'Logic/Component' : 'Resource';
-
-    res.json({ 
-      summary: `File: ${filePath}
-Language: ${ext || 'Text'}
-Size: ${(stats.size/1024).toFixed(2)} KB (${lines} lines)
-Purpose: ${purpose}
-Analysis: File appears well-formed. Analysis complete.`
+    const purpose = filePath.includes('test') ? 'Testing'
+      : filePath.includes('config') ? 'Configuration'
+      : ['ts', 'tsx', 'js', 'jsx'].includes(ext) ? 'Logic/Component'
+      : 'Resource';
+    res.json({
+      summary: `File: ${filePath}\nLanguage: ${ext || 'Text'}\nSize: ${(stats.size / 1024).toFixed(2)} KB (${lines} lines)\nPurpose: ${purpose}`
     });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -527,15 +458,14 @@ app.post('/api/tools/search_code', async (req, res) => {
   const { projectId, query, isRegex } = req.body;
   try {
     const projectDir = path.join(WORKSPACE_ROOT, projectId);
-    // Use grep -rIn for powerful search. -I skips binary files.
     const flags = isRegex ? '-rInE' : '-rIn';
-    const { stdout } = await execAsync(`grep ${flags} "${query.replace(/"/g, '\\"')}" .`, { 
+    const { stdout } = await execAsync(`grep ${flags} "${query.replace(/"/g, '\\"')}" .`, {
       cwd: projectDir,
-      maxBuffer: 1024 * 1024 // 1MB buffer for search results
+      maxBuffer: 1024 * 1024,
     });
     res.json({ results: stdout });
   } catch (err: any) {
-    if (err.code === 1) return res.json({ results: '' }); // No matches found
+    if (err.code === 1) return res.json({ results: '' });
     res.status(500).json({ error: err.message });
   }
 });
@@ -545,21 +475,15 @@ app.post('/api/tools/audit_files', async (req, res) => {
   try {
     const projectDir = path.join(WORKSPACE_ROOT, projectId);
     const auditData: any = {};
-    
-    // Read LLM.md for architectural context if it exists
     try {
       auditData.architecture = await fs.readFile(path.join(projectDir, 'LLM.md'), 'utf-8');
     } catch {}
-
     const filesContent = await Promise.all((paths as string[]).map(async (p) => {
       try {
         const content = await fs.readFile(path.join(projectDir, p), 'utf-8');
         return { path: p, content };
-      } catch {
-        return null;
-      }
+      } catch { return null; }
     }));
-
     auditData.files = filesContent.filter(f => f !== null);
     res.json(auditData);
   } catch (err: any) {
@@ -572,54 +496,33 @@ app.post('/api/tools/analyze_dependencies', async (req, res) => {
   try {
     const projectDir = path.join(WORKSPACE_ROOT, projectId);
     const files = db.prepare('SELECT path FROM files WHERE project_id = ?').all(projectId) as any[];
-    
-    // Filter for code files
     const codeFiles = files.filter(f => /\.(ts|tsx|js|jsx)$/.test(f.path));
-    
     const nodes: any[] = [];
     const links: any[] = [];
     const nodeMap = new Map();
-
     for (const f of codeFiles) {
-      const fullPath = path.join(projectDir, f.path);
       try {
-        const content = await fs.readFile(fullPath, 'utf-8');
+        const content = await fs.readFile(path.join(projectDir, f.path), 'utf-8');
         const repoName = f.path.split('/')[0] || 'root';
-        
-        if (!nodeMap.has(f.path)) {
-          nodes.push({ id: f.path, group: repoName });
-          nodeMap.set(f.path, true);
-        }
-
-        // Match import lines: import ... from '...' or import '...'
-        // Simple regex: could be improved but good for a start
+        if (!nodeMap.has(f.path)) { nodes.push({ id: f.path, group: repoName }); nodeMap.set(f.path, true); }
         const importRegex = /(?:import|from)\s+['"]([^'"]+)['"]/g;
         let match;
         while ((match = importRegex.exec(content)) !== null) {
           const target = match[1];
           if (target.startsWith('.')) {
-            // Resolve relative path
             const resolved = path.join(path.dirname(f.path), target);
-            // Try to find matching file in project
-            const targetFile = codeFiles.find(cf => 
-              cf.path === resolved || 
-              cf.path === resolved + '.ts' || 
-              cf.path === resolved + '.tsx' ||
-              cf.path === resolved + '.js' ||
+            const targetFile = codeFiles.find(cf =>
+              cf.path === resolved || cf.path === resolved + '.ts' ||
+              cf.path === resolved + '.tsx' || cf.path === resolved + '.js' ||
               cf.path === resolved + '/index.ts'
             );
-
-            if (targetFile) {
-              links.push({ source: f.path, target: targetFile.path, type: 'internal' });
-            }
+            if (targetFile) links.push({ source: f.path, target: targetFile.path, type: 'internal' });
           } else {
-            // External dependency
-            links.push({ source: f.path, target: target, type: 'external' });
+            links.push({ source: f.path, target, type: 'external' });
           }
         }
       } catch (e) {}
     }
-
     res.json({ nodes, links });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -630,18 +533,10 @@ app.post('/api/tools/run_shell', async (req, res) => {
   const { projectId, command } = req.body;
   try {
     const projectDir = path.join(WORKSPACE_ROOT, projectId);
-    
-    // Security check: only allow a whitelist of basic safe commands or just trust the sandbox for now
-    // In a real app we would be very careful here.
     const { stdout, stderr } = await execAsync(command, { cwd: projectDir });
-    
     res.json({ stdout, stderr });
   } catch (err: any) {
-    res.status(500).json({ 
-      error: err.message, 
-      stdout: err.stdout || '', 
-      stderr: err.stderr || '' 
-    });
+    res.status(500).json({ error: err.message, stdout: err.stdout || '', stderr: err.stderr || '' });
   }
 });
 
@@ -655,7 +550,7 @@ app.post('/api/tools/list_files', async (req, res) => {
   }
 });
 
-// --- Preview Service ---
+// ─── Preview Service ──────────────────────────────────────────────────────────
 app.get('/preview/:projectId/*', async (req, res) => {
   const { projectId } = req.params;
   const userPath = (req.params as any)[0] || 'index.html';
@@ -664,28 +559,16 @@ app.get('/preview/:projectId/*', async (req, res) => {
     if (existsSync(fullPath)) {
       if (userPath.endsWith('.html')) {
         const content = await fs.readFile(fullPath, 'utf-8');
-        const script = `
-          <script>
-            window.onerror = function(message, source, lineno, colno, error) {
-              window.parent.postMessage({
-                type: 'SANDBOX_ERROR',
-                message: message,
-                line: lineno,
-                column: colno,
-                source: source
-              }, '*');
+        const script = `<script>
+          window.onerror = function(message, source, lineno, colno) {
+            window.parent.postMessage({ type: 'SANDBOX_ERROR', message, line: lineno, column: colno, source }, '*');
+          };
+          console.error = (function(old) {
+            return function() { old.apply(console, arguments);
+              window.parent.postMessage({ type: 'SANDBOX_CONSOLE_ERROR', args: Array.from(arguments).map(String) }, '*');
             };
-            console.error = (function(oldError) {
-              return function() {
-                oldError.apply(console, arguments);
-                window.parent.postMessage({
-                  type: 'SANDBOX_CONSOLE_ERROR',
-                  args: Array.from(arguments).map(String)
-                }, '*');
-              };
-            })(console.error);
-          </script>
-        `;
+          })(console.error);
+        </script>`;
         res.send(content.replace('</head>', script + '</head>'));
       } else {
         res.sendFile(fullPath);
@@ -698,7 +581,9 @@ app.get('/preview/:projectId/*', async (req, res) => {
   }
 });
 
-// --- Server Setup ---
+// ─── Server Startup ───────────────────────────────────────────────────────────
+// All routes registered above. Vite (dev only) and listen() happen last,
+// so the healthcheck endpoint is always reachable immediately on boot.
 
 async function startServer() {
   const httpServer = createServer(app);
@@ -708,14 +593,12 @@ async function startServer() {
 
   io.on('connection', (socket) => {
     console.log('Client connected:', socket.id);
-    
+
     socket.on('join_project', (projectId) => {
       socket.join(projectId);
       if (!projectUsers[projectId]) projectUsers[projectId] = new Set();
       projectUsers[projectId].add(socket.id);
-      
       io.to(projectId).emit('presence_update', Array.from(projectUsers[projectId]).length);
-      console.log(`Socket ${socket.id} joined project ${projectId}`);
     });
 
     socket.on('editor_change', ({ projectId, path, changes }) => {
@@ -740,6 +623,7 @@ async function startServer() {
     });
   });
 
+  // Dev: mount Vite middleware AFTER all routes are registered
   if (process.env.NODE_ENV !== 'production') {
     const vite = await createViteServer({
       server: { middlewareMode: true },
@@ -747,15 +631,17 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
+    // Production: serve pre-built Vite output
     const distPath = path.join(__dirname, 'dist');
     app.use(express.static(distPath));
-    app.get('*', (req, res) => {
+    app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
+  // listen() is the LAST thing called — server is fully configured before accepting connections
   httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://localhost:${PORT}`);
+    console.log(`Boot complete — bldr running on http://localhost:${PORT}`);
   });
 }
 
