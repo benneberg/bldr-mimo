@@ -145,9 +145,9 @@ const PROVIDERS = {
 
 const MODELS: Record<Provider, Record<ModelTier, string>> = {
   mimo: {
-    smart: 'MiMo-V2.5-Pro',
-    fast:  'MiMo-V2.5',
-    cheap: 'MiMo-V2-Pro',
+    smart: 'mimo-v2.5-pro',
+    fast:  'mimo-v2.5',
+    cheap: 'mimo-v2-pro',
   },
   openai: {
     smart: 'gpt-4o',
