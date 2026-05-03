@@ -1,8 +1,8 @@
-# bldr-MiMo — Build Anywhere, Intelligently
+# bldr — Build Anywhere, Intelligently
 
-**bldr-mimo** is a mobile-first, AI-powered development environment designed for high-density code iteration on the go. It implements deterministic AI tool control and automated context compilation to make solo development efficient and reliable.
+**bldr** is a mobile-first, AI-powered development environment designed for high-density code iteration on the go. It implements deterministic AI tool control and automated context compilation to make solo development efficient and reliable.
 
-## Core Features
+## 🚀 Core Features
 
 - **Multi-Repository Workspaces**: Import multiple GitHub repositories or local ZIP files into a single unified workspace.
 - **CodeMirror Editor**: Full featured in-browser editor for manual code adjustments with syntax highlighting.
@@ -13,14 +13,14 @@
 - **Real-time Collaboration**: Multi-user presence tracking and remote editor synchronization powered by Socket.io.
 - **Information Hub**: Integrated project info panel with user guides, FAQs, and architectural insights.
 
-## Tech Stack
+## 🛠 Tech Stack
 
 - **Frontend**: React + Vite + Tailwind CSS + Framer Motion
 - **Backend**: Node.js + Express + SQLite (better-sqlite3)
 - **AI**: Gemini 2.0/3.0 Flash with advanced Function Calling (Tool Use)
 - **Context**: Code Context Compiler (CCC) methodology
 
-## Workspace Structure
+## 📂 Workspace Structure
 
 bldr workspaces use a flat hierarchy optimized for AI ingestion:
 - `/WORKSPACE.md`: Global inventory of all connected repositories and services.
