@@ -8,3 +8,6 @@ healthcheckPath = "/api/projects"
 healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
+
+[deploy.variables]
+NIXPACKS_NODE_VERSION = "20"
