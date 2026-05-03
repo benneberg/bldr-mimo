@@ -17,7 +17,7 @@
 
 - **Frontend**: React + Vite + Tailwind CSS + Framer Motion
 - **Backend**: Node.js + Express + SQLite (better-sqlite3)
-- **AI**: Gemini 2.0/3.0 Flash with advanced Function Calling (Tool Use)
+- **AI**: MiMo
 - **Context**: Code Context Compiler (CCC) methodology
 
 ## 📂 Workspace Structure
