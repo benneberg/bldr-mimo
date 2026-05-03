@@ -1,23 +1,21 @@
 /**
- * mimo.ts — MiMo API client
+ * mimo.ts — frontend API client
  *
- * Replaces the Gemini client entirely.
- * MiMo is called via the standard OpenAI-compatible chat/completions endpoint.
- * We force a single tool call (apply_code_changes) on every request.
+ * The frontend NEVER calls MiMo (or OpenAI) directly.
+ * All requests go through the server-side /api/ai proxy which holds the key.
+ *
+ * This file is intentionally thin — it just serializes the request
+ * and hands back the raw OpenAI-compatible response object.
  */
 
-export interface MiMoMessage {
+import type { Provider, ModelTier } from './providers';
+
+export interface ChatMessage {
   role: 'system' | 'user' | 'assistant';
   content: string;
 }
 
-export interface MiMoRequestOptions {
-  messages: MiMoMessage[];
-  tools: MiMoTool[];
-  tool_choice?: { type: 'function'; function: { name: string } };
-}
-
-export interface MiMoTool {
+export interface ToolDefinition {
   type: 'function';
   function: {
     name: string;
@@ -26,7 +24,7 @@ export interface MiMoTool {
   };
 }
 
-export interface MiMoToolCall {
+export interface ToolCall {
   id: string;
   type: 'function';
   function: {
@@ -35,38 +33,47 @@ export interface MiMoToolCall {
   };
 }
 
-export interface MiMoResponse {
+export interface ChatResponse {
   choices: {
     message: {
       role: string;
       content: string | null;
-      tool_calls?: MiMoToolCall[];
+      tool_calls?: ToolCall[];
     };
     finish_reason: string;
   }[];
 }
 
-// The frontend always calls the server-side proxy at /api/mimo.
-// The actual MiMo API key never leaves the server.
+export interface CallOptions {
+  messages: ChatMessage[];
+  tools?: ToolDefinition[];
+  tool_choice?: 'auto' | 'none' | { type: 'function'; function: { name: string } };
+  provider?: Provider;
+  tier?: ModelTier;
+  temperature?: number;
+}
 
-export async function callMiMo(options: MiMoRequestOptions): Promise<MiMoResponse> {
-  const response = await fetch('/api/mimo', {
+/**
+ * Send a chat completion request through the server proxy.
+ * Provider and tier selection happen server-side via the proxy.
+ */
+export async function callAI(options: CallOptions): Promise<ChatResponse> {
+  const response = await fetch('/api/ai', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      model: 'mimo-v2.5-pro',
+      provider: options.provider ?? 'mimo',
+      tier: options.tier ?? 'smart',
       messages: options.messages,
       tools: options.tools,
       tool_choice: options.tool_choice ?? 'auto',
-      temperature: 0.2,
+      temperature: options.temperature ?? 0.2,
     }),
   });
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`MiMo API error ${response.status}: ${errorText}`);
+    throw new Error(`AI proxy error ${response.status}: ${errorText}`);
   }
 
   return response.json();
