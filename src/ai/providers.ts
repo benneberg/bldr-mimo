@@ -27,9 +27,9 @@ export const PROVIDERS: Record<Provider, ProviderConfig> = {
 
 export const MODELS: Record<Provider, Record<ModelTier, string>> = {
   mimo: {
-    smart: 'MiMo-V2.5-Pro',   // best reasoning, tool calls
-    fast:  'MiMo-V2.5',       // faster, multimodal, 1M context
-    cheap: 'MiMo-V2-Pro',     // lowest cost
+    smart: 'mimo-v2.5-pro',   // best reasoning, tool calls
+    fast:  'mimo-v2.5',       // faster, multimodal, 1M context
+    cheap: 'mimo-v2-pro',     // lowest cost
   },
   openai: {
     smart: 'gpt-4o',
