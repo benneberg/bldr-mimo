@@ -3,7 +3,7 @@ builder = "RAILPACK"
 buildCommand = "npm run build"
 
 [deploy]
-startCommand = "npm run start"
+startCommand = "node --import tsx server.ts"
 healthcheckPath = "/api/projects"
 healthcheckTimeout = 30
 restartPolicyType = "ON_FAILURE"
