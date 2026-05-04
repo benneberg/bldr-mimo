@@ -957,65 +957,58 @@ app.get('/preview/:projectId/*', async (req, res) => {
 // ─── Server Startup ───────────────────────────────────────────────────────────
 // All routes registered above. Vite (dev only) and listen() happen last,
 // so the healthcheck endpoint is always reachable immediately on boot.
-
 async function startServer() {
   const httpServer = createServer(app);
   const io = new Server(httpServer);
 
-  const projectUsers: Record<string, Set<string>> = {};
+  // START SERVER IMMEDIATELY
+  httpServer.listen(PORT, '0.0.0.0', () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+
+  // ─── Socket setup (safe) ─────────────────
+  const projectUsers = {};
 
   io.on('connection', (socket) => {
-    console.log('Client connected:', socket.id);
-
     socket.on('join_project', (projectId) => {
       socket.join(projectId);
       if (!projectUsers[projectId]) projectUsers[projectId] = new Set();
       projectUsers[projectId].add(socket.id);
-      io.to(projectId).emit('presence_update', Array.from(projectUsers[projectId]).length);
-    });
-
-    socket.on('editor_change', ({ projectId, path, changes }) => {
-      socket.to(projectId).emit('remote_change', { path, changes, userId: socket.id });
-    });
-
-    socket.on('chat_message', ({ projectId, message }) => {
-      socket.to(projectId).emit('remote_chat', { message, userId: socket.id });
+      io.to(projectId).emit('presence_update', projectUsers[projectId].size);
     });
 
     socket.on('disconnecting', () => {
       for (const room of socket.rooms) {
-        if (projectUsers[room]) {
-          projectUsers[room].delete(socket.id);
-          io.to(room).emit('presence_update', projectUsers[room].size);
-        }
+        projectUsers[room]?.delete(socket.id);
       }
-    });
-
-    socket.on('disconnect', () => {
-      console.log('Client disconnected:', socket.id);
     });
   });
 
-  // Dev: mount Vite middleware AFTER all routes are registered
+  // ─── THEN load Vite / static ─────────────
   if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
+    try {
+      const vite = await createViteServer({
+        server: { middlewareMode: true },
+        appType: 'spa',
+      });
+      app.use(vite.middlewares);
+      console.log('Vite middleware loaded');
+    } catch (err) {
+      console.error('Vite failed:', err);
+    }
   } else {
-    // Production: serve pre-built Vite output
     const distPath = path.join(__dirname, 'dist');
+
+    if (!existsSync(distPath)) {
+      console.error('❌ dist folder missing — production build not found');
+    }
+
     app.use(express.static(distPath));
+
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
-
-  // listen() is the LAST thing called — server is fully configured before accepting connections
-  httpServer.listen(PORT, '0.0.0.0', () => {
-    console.log(`Boot complete — bldr running on http://localhost:${PORT}`);
-  });
 }
 
 startServer();
