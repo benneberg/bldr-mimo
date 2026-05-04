@@ -3,11 +3,12 @@ import {
   FolderCode, MessageSquare, Play, Database,
   ArrowLeft, Info, ChevronRight, Layers,
   Plus, Trash2, X, FolderPlus, Loader2,
-  Github, AlertTriangle,
+  Github, AlertTriangle, BookOpen,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { io, Socket } from 'socket.io-client';
 import { ArchitecturePanel } from './components/arch/ArchitecturePanel';
+import { PKMLPanel } from './components/panels/PKMLPanel';
 import { ChatPanel } from './components/chat/ChatPanel';
 import { ImportPanel, TabButton } from './components/panels/Common';
 import { FilesPanel } from './components/panels/FilesPanel';
@@ -267,7 +268,7 @@ function DeleteConfirmModal({
 
 // ─── App ──────────────────────────────────────────────────────────────────────
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'chat' | 'files' | 'preview' | 'arch'>('chat');
+  const [activeTab, setActiveTab] = useState<'chat' | 'files' | 'preview' | 'arch' | 'pkml'>('chat');
   const [projects, setProjects] = useState<Project[]>([]);
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [isImporting, setIsImporting] = useState(false);
@@ -627,6 +628,14 @@ export default function App() {
               </PanelErrorBoundary>
             </motion.div>
           )}
+
+          {activeTab === 'pkml' && (
+            <motion.div key="pkml" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }} className="absolute inset-0">
+              <PanelErrorBoundary label="PKML Panel">
+                <PKMLPanel projectId={selectedProjectId!} />
+              </PanelErrorBoundary>
+            </motion.div>
+          )}
         </AnimatePresence>
       </main>
 
@@ -636,6 +645,7 @@ export default function App() {
         <TabButton active={activeTab === 'files'}   onClick={() => setActiveTab('files')}   icon={<FolderCode />}    label="Files" />
         <TabButton active={activeTab === 'preview'} onClick={() => setActiveTab('preview')} icon={<Play />}          label="Preview" />
         <TabButton active={activeTab === 'arch'}    onClick={() => setActiveTab('arch')}    icon={<Layers />}        label="Arch" />
+        <TabButton active={activeTab === 'pkml'}    onClick={() => setActiveTab('pkml')}    icon={<BookOpen />}      label="PKML" />
       </nav>
 
       {/* Delete modal from within project view (edge case) */}
