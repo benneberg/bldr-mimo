@@ -97,6 +97,22 @@ app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
 });
 
+// ─── Persistence diagnostic ───────────────────────────────────────────────────
+app.get('/api/diagnostics', (_req, res) => {
+  const projectCount = (db.prepare('SELECT COUNT(*) as n FROM projects').get() as any).n;
+  const fileCount = (db.prepare('SELECT COUNT(*) as n FROM files').get() as any).n;
+  res.json({
+    data_dir: DATA_DIR,
+    db_path: DB_PATH,
+    workspace_root: WORKSPACE_ROOT,
+    data_dir_exists: existsSync(DATA_DIR),
+    workspace_exists: existsSync(WORKSPACE_ROOT),
+    project_count: projectCount,
+    file_count: fileCount,
+    node_env: process.env.NODE_ENV ?? 'not set',
+  });
+});
+
 // ─── Basic Auth Gate ──────────────────────────────────────────────────────────
 // Only activates when ADMIN_USER + ADMIN_PASS are set (skipped in local dev).
 const ADMIN_USER = process.env.ADMIN_USER;
@@ -322,7 +338,12 @@ function sanitizePath(projectId: string, userPath: string) {
 // ─── API Routes ───────────────────────────────────────────────────────────────
 
 app.get('/api/projects', (_req, res) => {
-  const projects = db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all();
+  const rows = db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all() as any[];
+  // Normalise createdAt so frontend always gets a usable timestamp
+  const projects = rows.map(r => ({
+    ...r,
+    createdAt: r.created_at ? new Date(r.created_at).getTime() : Date.now(),
+  }));
   res.json(projects);
 });
 
@@ -335,6 +356,47 @@ app.post('/api/projects', (req, res) => {
     fs.mkdir(projectDir, { recursive: true });
   }
   res.json({ id, name });
+});
+
+app.delete('/api/projects/:projectId', async (req, res) => {
+  const { projectId } = req.params;
+  try {
+    // Remove all DB records
+    db.prepare('DELETE FROM files WHERE project_id = ?').run(projectId);
+    db.prepare('DELETE FROM repositories WHERE project_id = ?').run(projectId);
+    db.prepare('DELETE FROM conversations WHERE project_id = ?').run(projectId);
+    db.prepare('DELETE FROM projects WHERE id = ?').run(projectId);
+    // Remove workspace files
+    const projectDir = path.join(WORKSPACE_ROOT, projectId);
+    if (existsSync(projectDir)) {
+      await fs.rm(projectDir, { recursive: true, force: true });
+    }
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/projects/empty', async (req, res) => {
+  const { name } = req.body;
+  if (!name?.trim()) return res.status(400).json({ error: 'Name is required' });
+  const id = uuidv4();
+  try {
+    db.prepare('INSERT INTO projects (id, name) VALUES (?, ?)').run(id, name.trim());
+    const projectDir = path.join(WORKSPACE_ROOT, id);
+    await fs.mkdir(projectDir, { recursive: true });
+    // Seed a minimal WORKSPACE.md
+    const workspaceContent = `# Workspace: ${name.trim()}
+
+Empty project — add files to get started.
+`;
+    await fs.writeFile(path.join(projectDir, 'WORKSPACE.md'), workspaceContent);
+    db.prepare('INSERT OR REPLACE INTO files (project_id, path, size) VALUES (?, ?, ?)')
+      .run(id, 'WORKSPACE.md', workspaceContent.length);
+    res.json({ id, name: name.trim() });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.get('/api/projects/:projectId/repositories', (req, res) => {
