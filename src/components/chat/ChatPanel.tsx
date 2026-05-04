@@ -373,6 +373,31 @@ export function ChatPanel({
     }
   }, [turns, isLoading, liveActivity]);
 
+  // ── Auto-send when explanationRequest arrives from FilesPanel ──────────────
+  useEffect(() => {
+    if (!explanationRequest) return;
+    const { path, content: fileContent } = explanationRequest;
+
+    // Build a concrete intent based on what triggered this
+    let intent: string;
+    if (path && fileContent?.startsWith('Review these files:')) {
+      // onReview call — audit multiple files
+      intent = fileContent; // already formatted as "Review these files:
+path1
+path2"
+    } else if (path) {
+      // onExplain call — explain a single file
+      intent = `Explain what ${path} does, its purpose, and how it fits into the overall architecture.`;
+    } else {
+      intent = fileContent ?? '';
+    }
+
+    if (intent.trim()) {
+      handleSend(intent);
+      onExplanated?.();
+    }
+  }, [explanationRequest]);
+
   const addActivity = (type: ActivityEvent['type'], message: string) => {
     const event: ActivityEvent = { id: crypto.randomUUID(), type, message, timestamp: Date.now() };
     setLiveActivity((prev) => [...prev, event]);
