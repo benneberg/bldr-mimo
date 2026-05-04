@@ -177,18 +177,18 @@ function getClient(provider: Provider): OpenAI {
   return new OpenAI({ apiKey: cfg.apiKey(), baseURL: cfg.baseURL });
 }
 
-async function withRetry<T>(fn: () => Promise<T>, retries = 3, delayMs = 1000): Promise<T> {
-  try {
-    return await fn();
-  } catch (err: any) {
-    if (retries <= 0) throw err;
-    await new Promise(r => setTimeout(r, delayMs));
-    return withRetry(fn, retries - 1, delayMs * 1.5);
-  }
-}
-
+// Single-attempt proxy — retries are managed by aiService.ts on the frontend.
+// withRetry removed: it caused up to 9 total attempts (3 frontend × 3 server)
+// and masked real errors behind generic timeouts.
 app.post('/api/ai', async (req, res) => {
-  const { provider = 'mimo', tier = 'smart', messages, tools, tool_choice, temperature = 0.2 } = req.body;
+  const {
+    provider = 'mimo',
+    tier = 'smart',
+    messages,
+    tools,
+    tool_choice,
+    temperature = 0.2,
+  } = req.body;
 
   const resolvedProvider = (provider in PROVIDERS ? provider : 'mimo') as Provider;
   const resolvedTier = (tier in (MODELS[resolvedProvider] ?? {}) ? tier : 'smart') as ModelTier;
@@ -197,49 +197,38 @@ app.post('/api/ai', async (req, res) => {
 
   if (!apiKey) {
     return res.status(500).json({
-      error: `API key not configured for provider "${resolvedProvider}". Set ${resolvedProvider === 'mimo' ? 'MIMO_API_KEY' : 'OPENAI_API_KEY'} in environment variables.`
+      error: `API key not configured for provider "${resolvedProvider}". ` +
+        `Set ${resolvedProvider === 'mimo' ? 'MIMO_API_KEY' : 'OPENAI_API_KEY'} in Railway environment variables.`,
     });
   }
+
+  // Hard server-side timeout: 50s (frontend AbortController fires at 55s)
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 50_000);
 
   try {
     const client = getClient(resolvedProvider);
 
-    const result = await withRetry(() =>
-      client.chat.completions.create({
-        model,
-        messages,
-        tools,
-        tool_choice,
-        temperature,
-      } as any)
+    console.log(`[AI] ${resolvedProvider}/${model} → ${messages?.length ?? 0} messages, ${tools?.length ?? 0} tools`);
+
+    const result = await client.chat.completions.create(
+      { model, messages, tools, tool_choice, temperature } as any,
+      { signal: controller.signal }
     );
 
+    console.log(`[AI] ${resolvedProvider}/${model} ✓ ${(result as any).usage?.total_tokens ?? '?'} tokens`);
     res.json(result);
   } catch (err: any) {
-    console.error(`[AI Proxy] ${resolvedProvider}/${model} error:`, err.message);
+    const isTimeout = err.name === 'AbortError' || err.code === 'ETIMEDOUT';
+    const statusCode = isTimeout ? 504 : 500;
+    const message = isTimeout
+      ? `MiMo request timed out after 50s (model: ${model})`
+      : err.message ?? 'Unknown error';
 
-    // Fallback to MiMo fast tier if primary call fails (and we're not already on mimo/fast)
-    if (resolvedProvider !== 'mimo' || resolvedTier !== 'fast') {
-      console.log('[AI Proxy] Attempting fallback to mimo/fast...');
-      try {
-        const fallbackClient = getClient('mimo');
-        const fallbackKey = PROVIDERS.mimo.apiKey();
-        if (fallbackKey) {
-          const fallbackResult = await fallbackClient.chat.completions.create({
-            model: MODELS.mimo.fast,
-            messages,
-            tools,
-            tool_choice,
-            temperature,
-          } as any);
-          return res.json(fallbackResult);
-        }
-      } catch (fallbackErr: any) {
-        console.error('[AI Proxy] Fallback also failed:', fallbackErr.message);
-      }
-    }
-
-    res.status(500).json({ error: err.message });
+    console.error(`[AI] ${resolvedProvider}/${model} ✗ ${message}`);
+    res.status(statusCode).json({ error: message, model, provider: resolvedProvider });
+  } finally {
+    clearTimeout(timeoutId);
   }
 });
 
@@ -591,15 +580,56 @@ app.post('/api/tools/read_file', async (req, res) => {
 });
 
 app.post('/api/tools/write_file', async (req, res) => {
-  const { projectId, path: filePath, content } = req.body;
+  const { projectId, path: filePath, content, search_block, replace_block, strategy } = req.body;
   try {
     const fullPath = sanitizePath(projectId, filePath);
     const dir = path.dirname(fullPath);
     if (!existsSync(dir)) await fs.mkdir(dir, { recursive: true });
+
+    // ── Backup before any write ──────────────────────────────────────────────
+    let backedUp = false;
+    if (existsSync(fullPath)) {
+      try {
+        const backupDir = path.join(WORKSPACE_ROOT, projectId, '.backups');
+        if (!existsSync(backupDir)) await fs.mkdir(backupDir, { recursive: true });
+        const safePathName = filePath.replace(/[\/]/g, '_');
+        const backupPath = path.join(backupDir, `${safePathName}.${Date.now()}.bak`);
+        await fs.copyFile(fullPath, backupPath);
+        backedUp = true;
+      } catch {
+        // Backup failure is non-fatal — continue with write
+      }
+    }
+
+    // ── Strategy: replace_section (patch) ────────────────────────────────────
+    if (strategy === 'replace_section' || (search_block !== undefined && replace_block !== undefined)) {
+      if (!existsSync(fullPath)) {
+        return res.status(422).json({ error: 'replace_section requires an existing file' });
+      }
+      const original = await fs.readFile(fullPath, 'utf-8');
+      if (!original.includes(search_block)) {
+        return res.status(422).json({
+          error: 'search_block not found in file — the file may have changed',
+          hint: 'Try again or use strategy=full_file',
+        });
+      }
+      // Replace only the FIRST occurrence
+      const patched = original.replace(search_block, replace_block ?? '');
+      await fs.writeFile(fullPath, patched);
+      db.prepare('INSERT OR REPLACE INTO files (project_id, path, size) VALUES (?, ?, ?)')
+        .run(projectId, filePath, patched.length);
+      return res.json({ success: true, strategy: 'replace_section', backed_up: backedUp });
+    }
+
+    // ── Strategy: full_file (overwrite) ───────────────────────────────────────
+    if (content === undefined || content === null) {
+      return res.status(400).json({ error: 'content is required for full_file strategy' });
+    }
     await fs.writeFile(fullPath, content);
     db.prepare('INSERT OR REPLACE INTO files (project_id, path, size) VALUES (?, ?, ?)')
       .run(projectId, filePath, content.length);
-    res.json({ success: true });
+    res.json({ success: true, strategy: 'full_file', backed_up: backedUp });
+
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
