@@ -133,14 +133,113 @@ async function loadRepoMap(projectId: string): Promise<string> {
   }
 }
 
+async function loadPKML(projectId: string): Promise<string> {
+  try {
+    const res = await fetch(`/api/projects/${projectId}/pkml`);
+    const data = await res.json();
+    if (!data.exists || !data.content) return '';
+
+    const p = data.content;
+    const prod = p.product ?? {};
+    const eng = p.engineering ?? {};
+
+    let out = `## PKML — Product Intent
+`;
+    out += `**Product:** ${prod.name ?? 'unknown'} — ${prod.tagline ?? ''}
+`;
+    if (prod.positioning?.problem) out += `**Problem:** ${prod.positioning.problem}
+`;
+    if (prod.positioning?.solution) out += `**Solution:** ${prod.positioning.solution}
+`;
+
+    if (eng.constraints?.length) {
+      out += `
+**Engineering Constraints:**
+`;
+      for (const c of eng.constraints.slice(0, 5)) {
+        out += `- [${c.severity ?? 'medium'}] ${c.rule} — ${c.reason}
+`;
+      }
+    }
+
+    if (eng.lessons_learned?.length) {
+      out += `
+**Lessons Learned:**
+`;
+      for (const l of eng.lessons_learned.slice(0, 3)) {
+        out += `- ${l.what_happened} → ${l.correct_approach}
+`;
+      }
+    }
+
+    if (eng.implementation_patterns?.length) {
+      out += `
+**Implementation Patterns:**
+`;
+      for (const pat of eng.implementation_patterns.slice(0, 3)) {
+        out += `- ${pat.name}: ${pat.when_to_use}
+`;
+      }
+    }
+
+    return out;
+  } catch {
+    return '';
+  }
+}
+
+async function loadCCCContext(projectId: string): Promise<string> {
+  try {
+    const res = await fetch(`/api/projects/${projectId}/ccc/context`);
+    const data = await res.json();
+    if (!data.exists) return '';
+
+    let out = `## CCC — Codebase Reality
+`;
+    if (data.entry_points?.length) {
+      out += `**Entry points:** ${data.entry_points.join(', ')}
+`;
+    }
+    if (data.tech_stack?.length) {
+      out += `**Tech stack:** ${data.tech_stack.slice(0, 12).join(', ')}
+`;
+    }
+    if (data.conventions?.length) {
+      out += `**Conventions:** ${data.conventions.join(', ')}
+`;
+    }
+    // Top exported symbols per file
+    if (data.symbols) {
+      const top = Object.entries(data.symbols as Record<string, any[]>)
+        .sort(([, a], [, b]) => b.length - a.length)
+        .slice(0, 8);
+      if (top.length) {
+        out += `**Key modules:**
+`;
+        for (const [file, syms] of top) {
+          const names = syms.map((s: any) => s.name).join(', ');
+          out += `- \`${file}\`: ${names}
+`;
+        }
+      }
+    }
+    return out;
+  } catch {
+    return '';
+  }
+}
+
 async function loadContext(projectId: string): Promise<string> {
-  const [workspace, llm] = await Promise.all([
+  const [workspace, pkml, ccc] = await Promise.all([
     readProjectFile(projectId, 'WORKSPACE.md'),
-    readProjectFile(projectId, 'LLM.md'),
+    loadPKML(projectId),
+    loadCCCContext(projectId),
   ]);
+  // PKML = intent layer, CCC = reality layer, keep them separate
   return [
-    workspace ? `### WORKSPACE.md\n${workspace}` : '',
-    llm       ? `### LLM.md (conventions)\n${llm}` : '',
+    pkml      ? pkml : '',
+    ccc       ? ccc : '',
+    workspace ? `## Workspace Map\n${workspace}` : '',
   ].filter(Boolean).join('\n\n');
 }
 
