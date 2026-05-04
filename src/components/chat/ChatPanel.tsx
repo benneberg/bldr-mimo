@@ -16,7 +16,7 @@ import {
   Activity, Coins, ChevronUp, RotateCcw,
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { requestChanges, ValidationError } from '../../ai/aiService';
+import { requestChanges, ValidationError, TimeoutError } from '../../ai/aiService';
 import type { CodeChange } from '../../ai/validators';
 import type { Provider, ModelTier } from '../../ai/providers';
 
@@ -56,6 +56,7 @@ interface ConversationTurn {
   tier: ModelTier;
   model: string;
   duration: number | null;
+  textResponse: string | null;
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -382,7 +383,9 @@ export function ChatPanel({
     let intent: string;
     if (path && fileContent?.startsWith('Review these files:')) {
       // onReview call — audit multiple files
-      intent = fileContent; // already formatted as "Review these files: path1 path2"
+      intent = fileContent; // already formatted as "Review these files:
+path1
+path2"
     } else if (path) {
       // onExplain call — explain a single file
       intent = `Explain what ${path} does, its purpose, and how it fits into the overall architecture.`;
@@ -416,7 +419,7 @@ export function ChatPanel({
     setTurns((prev) => [...prev, {
       id: turnId, intent, blocks: [], error: null,
       timestamp: Date.now(), activity: [], tokenUsage: null,
-      provider, tier, model: '', duration: null,
+      provider, tier, model: '', duration: null, textResponse: null,
     }]);
 
     addActivity('info', `Starting with ${PROVIDER_LABELS[provider]} (${TIER_LABELS[tier].label})`);
@@ -431,12 +434,16 @@ export function ChatPanel({
       });
 
       const duration = Date.now() - startTime;
-      const { changes, tokenUsage, model: usedModel, expandedIntent } = result;
+      const { changes, tokenUsage, model: usedModel, expandedIntent, textResponse } = result;
       if (expandedIntent) {
         addActivity('info', `🔄 Interpreted as: "${expandedIntent.slice(0, 120)}${expandedIntent.length > 120 ? '…' : ''}"`);
       }
 
-      addActivity('info', `Got ${changes.length} change${changes.length !== 1 ? 's' : ''} in ${formatDuration(duration)}`);
+      if (textResponse) {
+        addActivity('info', '✓ Response ready');
+      } else {
+        addActivity('info', `Got ${changes.length} change${changes.length !== 1 ? 's' : ''} in ${formatDuration(duration)}`);
+      }
 
       const blocks: ChangeBlock[] = changes.map((change) => ({
         id: crypto.randomUUID(), change, status: 'pending', isExpanded: false,
@@ -447,6 +454,7 @@ export function ChatPanel({
       setTurns((prev) => prev.map((t) =>
         t.id !== turnId ? t : {
           ...t, blocks,
+          textResponse: textResponse ?? null,
           activity: finalActivity,
           tokenUsage: tokenUsage ?? null,
           model: usedModel ?? '',
@@ -457,12 +465,15 @@ export function ChatPanel({
       const duration = Date.now() - startTime;
       let message = 'Unknown error';
 
-      if (err instanceof ValidationError) {
+      if (err instanceof TimeoutError) {
         message = err.message;
         addActivity('error', message);
-        // Helpful hint for the "did not call tool" case
-        if (message.includes('did not call apply_code_changes')) {
-          addActivity('info', 'Tip: Try being more specific. Instead of "improve architecture", try "extract the API calls in App.tsx into a separate service file".');
+        addActivity('info', 'Tip: Switch to the Fast tier for quicker responses, or break your request into smaller steps.');
+      } else if (err instanceof ValidationError) {
+        message = err.message;
+        addActivity('error', message);
+        if (message.includes('text instead of a tool call')) {
+          addActivity('info', 'Tip: Be specific about what to change — name the file and describe the exact edit.');
         }
       } else if (err instanceof Error) {
         message = err.message;
@@ -493,10 +504,22 @@ export function ChatPanel({
   const handleAccept = async (turnId: string, block: ChangeBlock) => {
     setApplyingBlockId(block.id);
     try {
+      const change = block.change;
+      const body: Record<string, any> = {
+        projectId,
+        path: change.file,
+        strategy: change.strategy,
+      };
+      if (change.strategy === 'replace_section') {
+        body.search_block = change.search_block;
+        body.replace_block = change.replace_block;
+      } else {
+        body.content = change.content;
+      }
       const res = await fetch('/api/tools/write_file', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ projectId, path: block.change.file, content: block.change.content }),
+        body: JSON.stringify(body),
       });
       if (!res.ok) {
         const err = await res.json();
@@ -600,6 +623,21 @@ export function ChatPanel({
                     <RotateCcw className="w-3 h-3" />
                     Retry
                   </button>
+                </div>
+              </div>
+            )}
+
+            {/* Text response (EXPLAIN / QUESTION) */}
+            {turn.textResponse && (
+              <div className="ml-10 space-y-2">
+                <div className="flex items-center gap-3 mb-2">
+                  <div className="w-7 h-7 rounded bg-mimo-bg border border-mimo-accent flex items-center justify-center shrink-0">
+                    <div className="w-1.5 h-1.5 bg-mimo-accent rounded-full" />
+                  </div>
+                  <div className="text-[9px] font-mono font-bold uppercase tracking-widest opacity-40">bldr</div>
+                </div>
+                <div className="prose prose-invert prose-sm max-w-none text-mimo-text-muted leading-relaxed text-sm whitespace-pre-wrap rounded-xl border border-mimo-border bg-mimo-panel px-4 py-3">
+                  {turn.textResponse}
                 </div>
               </div>
             )}
