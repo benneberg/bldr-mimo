@@ -382,9 +382,7 @@ export function ChatPanel({
     let intent: string;
     if (path && fileContent?.startsWith('Review these files:')) {
       // onReview call — audit multiple files
-      intent = fileContent; // already formatted as "Review these files:
-path1
-path2"
+      intent = fileContent; // already formatted as "Review these files: path1 path2"
     } else if (path) {
       // onExplain call — explain a single file
       intent = `Explain what ${path} does, its purpose, and how it fits into the overall architecture.`;
