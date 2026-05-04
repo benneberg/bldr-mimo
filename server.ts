@@ -454,6 +454,10 @@ app.post('/api/import/github', async (req, res) => {
     }
 
     await generateProjectContext(id);
+    // Trigger CCC extraction after import (non-blocking)
+    fetch(`http://localhost:${PORT}/api/projects/${id}/ccc/extract`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }
+    }).catch(() => {});
     res.json({ id, repoId });
   } catch (error: any) {
     console.error('Import failed:', error);
@@ -492,6 +496,10 @@ app.post('/api/import/zip', upload.single('file'), async (req, res) => {
     }
 
     await generateProjectContext(id);
+    // Trigger CCC extraction after import (non-blocking)
+    fetch(`http://localhost:${PORT}/api/projects/${id}/ccc/extract`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }
+    }).catch(() => {});
     await fs.unlink(req.file.path);
     res.json({ id, repoId });
   } catch (error: any) {
@@ -688,6 +696,198 @@ app.post('/api/tools/list_files', async (req, res) => {
   try {
     const files = db.prepare('SELECT path FROM files WHERE project_id = ?').all(projectId);
     res.json({ files: files.map((f: any) => f.path) });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── PKML endpoints ───────────────────────────────────────────────────────────
+
+app.get('/api/projects/:projectId/pkml', async (req, res) => {
+  const { projectId } = req.params;
+  try {
+    const pkmlPath = path.join(WORKSPACE_ROOT, projectId, 'project.pkml.json');
+    if (!existsSync(pkmlPath)) {
+      return res.json({ exists: false, content: null });
+    }
+    const content = await fs.readFile(pkmlPath, 'utf-8');
+    res.json({ exists: true, content: JSON.parse(content) });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/projects/:projectId/pkml', async (req, res) => {
+  const { projectId } = req.params;
+  const { content } = req.body;
+  try {
+    const projectDir = path.join(WORKSPACE_ROOT, projectId);
+    const pkmlPath = path.join(projectDir, 'project.pkml.json');
+    const json = typeof content === 'string' ? content : JSON.stringify(content, null, 2);
+    await fs.writeFile(pkmlPath, json);
+    db.prepare('INSERT OR REPLACE INTO files (project_id, path, size) VALUES (?, ?, ?)')
+      .run(projectId, 'project.pkml.json', json.length);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─── CCC — lightweight IR extraction ──────────────────────────────────────────
+// Extracts symbols, conventions, and structure from the codebase.
+// Stores results in .llm-context/ inside the project workspace.
+
+app.post('/api/projects/:projectId/ccc/extract', async (req, res) => {
+  const { projectId } = req.params;
+  try {
+    const projectDir = path.join(WORKSPACE_ROOT, projectId);
+    const files = db.prepare('SELECT path, size FROM files WHERE project_id = ?').all(projectId) as any[];
+
+    const cccDir = path.join(projectDir, '.llm-context');
+    if (!existsSync(cccDir)) await fs.mkdir(cccDir, { recursive: true });
+
+    // ── Symbol index ───────────────────────────────────────────────────────
+    const symbols: Record<string, any[]> = {};
+    const conventions: string[] = [];
+    const entryPoints: string[] = [];
+    const techStack = new Set<string>();
+
+    const codeExts = ['.ts', '.tsx', '.js', '.jsx'];
+    for (const f of files) {
+      const ext = path.extname(f.path);
+      if (!codeExts.includes(ext)) continue;
+
+      try {
+        const src = await fs.readFile(path.join(projectDir, f.path), 'utf-8');
+        const fileSymbols: any[] = [];
+
+        // Extract exports (functions, classes, consts)
+        const exportRegex = /export\s+(default\s+)?(function|class|const|let|type|interface)\s+([A-Za-z_$][A-Za-z0-9_$]*)/g;
+        let m;
+        while ((m = exportRegex.exec(src)) !== null) {
+          fileSymbols.push({ kind: m[2], name: m[3], exported: true });
+        }
+
+        // Extract imports to detect tech stack
+        const importRegex = /from\s+['"]([^'"./][^'"]*)['"]/g;
+        while ((m = importRegex.exec(src)) !== null) {
+          const pkg = m[1].split('/')[0];
+          techStack.add(pkg);
+        }
+
+        if (fileSymbols.length) symbols[f.path] = fileSymbols;
+
+        // Detect entry points
+        const base = path.basename(f.path).toLowerCase();
+        if (['index.ts','index.tsx','main.ts','main.tsx','app.tsx','app.ts','server.ts'].includes(base)) {
+          entryPoints.push(f.path);
+        }
+
+        // Detect conventions
+        if (src.includes('useState') && !conventions.includes('React hooks')) conventions.push('React hooks');
+        if (src.includes('tailwind') || src.includes('className=')) conventions.push('Tailwind CSS');
+        if (src.includes('async function') || src.includes('async (')) conventions.push('Async/await');
+        if (src.includes("'use client'")) conventions.push('Next.js client components');
+        if (src.match(/z\.object|z\.string|z\.array/)) conventions.push('Zod validation');
+
+      } catch { /* skip unreadable files */ }
+    }
+
+    // ── Build IR artifacts ─────────────────────────────────────────────────
+    const uniqueConventions = [...new Set(conventions)];
+    const filteredStack = [...techStack].filter(p =>
+      !p.startsWith('@types') && p !== 'node' && p.length < 40
+    );
+
+    const symbolIndex = {
+      generated_at: new Date().toISOString(),
+      entry_points: entryPoints,
+      tech_stack: filteredStack,
+      conventions: uniqueConventions,
+      symbols,
+      file_count: files.length,
+    };
+
+    await fs.writeFile(
+      path.join(cccDir, 'symbol-index.json'),
+      JSON.stringify(symbolIndex, null, 2)
+    );
+
+    // ── CONTEXT.md — LLM-ready IR summary ─────────────────────────────────
+    const topFiles = Object.entries(symbols)
+      .sort(([, a], [, b]) => b.length - a.length)
+      .slice(0, 15);
+
+    let contextMd = `# CCC Context IR
+
+`;
+    contextMd += `Generated: ${new Date().toISOString()}
+
+`;
+
+    if (entryPoints.length) {
+      contextMd += `## Entry Points
+${entryPoints.map(e => `- \`${e}\``).join('
+')}
+
+`;
+    }
+
+    if (filteredStack.length) {
+      contextMd += `## Tech Stack (detected)
+${filteredStack.slice(0, 20).map(t => `- ${t}`).join('
+')}
+
+`;
+    }
+
+    if (uniqueConventions.length) {
+      contextMd += `## Conventions
+${uniqueConventions.map(c => `- ${c}`).join('
+')}
+
+`;
+    }
+
+    if (topFiles.length) {
+      contextMd += `## Key Modules (by export count)
+`;
+      for (const [file, syms] of topFiles) {
+        const names = (syms as any[]).map(s => s.name).join(', ');
+        contextMd += `- \`${file}\`: ${names}
+`;
+      }
+    }
+
+    await fs.writeFile(path.join(projectDir, 'CONTEXT.md'), contextMd);
+    db.prepare('INSERT OR REPLACE INTO files (project_id, path, size) VALUES (?, ?, ?)')
+      .run(projectId, 'CONTEXT.md', contextMd.length);
+    db.prepare('INSERT OR REPLACE INTO files (project_id, path, size) VALUES (?, ?, ?)')
+      .run(projectId, '.llm-context/symbol-index.json', JSON.stringify(symbolIndex).length);
+
+    res.json({
+      success: true,
+      entry_points: entryPoints,
+      symbol_count: Object.values(symbols).flat().length,
+      tech_stack: filteredStack.slice(0, 10),
+      conventions: uniqueConventions,
+    });
+  } catch (err: any) {
+    console.error('CCC extraction failed:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/projects/:projectId/ccc/context', async (req, res) => {
+  const { projectId } = req.params;
+  try {
+    const cccDir = path.join(WORKSPACE_ROOT, projectId, '.llm-context');
+    const indexPath = path.join(cccDir, 'symbol-index.json');
+    if (!existsSync(indexPath)) {
+      return res.json({ exists: false });
+    }
+    const index = JSON.parse(await fs.readFile(indexPath, 'utf-8'));
+    res.json({ exists: true, ...index });
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
