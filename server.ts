@@ -375,10 +375,7 @@ app.post('/api/projects/empty', async (req, res) => {
     const projectDir = path.join(WORKSPACE_ROOT, id);
     await fs.mkdir(projectDir, { recursive: true });
     // Seed a minimal WORKSPACE.md
-    const workspaceContent = `# Workspace: ${name.trim()}
-
-Empty project — add files to get started.
-`;
+    const workspaceContent = `# Workspace: ${name.trim()} Empty project — add files to get started.`;
     await fs.writeFile(path.join(projectDir, 'WORKSPACE.md'), workspaceContent);
     db.prepare('INSERT OR REPLACE INTO files (project_id, path, size) VALUES (?, ?, ?)')
       .run(id, 'WORKSPACE.md', workspaceContent.length);
