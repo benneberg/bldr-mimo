@@ -848,33 +848,26 @@ app.post('/api/projects/:projectId/ccc/extract', async (req, res) => {
       .sort(([, a], [, b]) => b.length - a.length)
       .slice(0, 15);
 
-    let contextMd = `# CCC Context IR
-
-`;
-    contextMd += `Generated: ${new Date().toISOString()}
-
-`;
+    let contextMd = `# CCC Context IR `;
+    contextMd += `Generated: ${new Date().toISOString()} `;
 
     if (entryPoints.length) {
       contextMd += `## Entry Points
-${entryPoints.map(e => `- \`${e}\``).join('
-')}
+${entryPoints.map(e => `- \`${e}\``).join('\n')}
 
 `;
     }
 
     if (filteredStack.length) {
       contextMd += `## Tech Stack (detected)
-${filteredStack.slice(0, 20).map(t => `- ${t}`).join('
-')}
+${filteredStack.slice(0, 20).map(t => `- ${t}`).join('\n')}
 
 `;
     }
 
     if (uniqueConventions.length) {
       contextMd += `## Conventions
-${uniqueConventions.map(c => `- ${c}`).join('
-')}
+${uniqueConventions.map(c => `- ${c}`).join('\n')}
 
 `;
     }
@@ -883,10 +876,9 @@ ${uniqueConventions.map(c => `- ${c}`).join('
       contextMd += `## Key Modules (by export count)
 `;
       for (const [file, syms] of topFiles) {
-        const names = (syms as any[]).map(s => s.name).join(', ');
-        contextMd += `- \`${file}\`: ${names}
-`;
-      }
+  const names = (syms as any[]).map(s => s.name).join(', ');
+  contextMd += `- \`${file}\`: ${names}\n`;
+}
     }
 
     await fs.writeFile(path.join(projectDir, 'CONTEXT.md'), contextMd);
